@@ -46,6 +46,17 @@ func Process(w http.ResponseWriter, r *http.Request) {
 
 	glog.Infof("[%s] %s %s; content-len=%d", reqID, r.Method, r.URL.Path, r.ContentLength)
 	_, args.data, err = getRequestBody(r, rc)
+
+	if err == nil {
+		err = args.parseMethod(r, rc)
+	}
+	if err == nil {
+		err = args.parseClientVersion(r, rc)
+	}
+	if err == nil {
+		err = args.parseQueryParams(r)
+	}
+
 	if err != nil {
 		status, data, rtype = prepareErrorResponse(err, r)
 		goto write_resp
@@ -54,9 +65,9 @@ func Process(w http.ResponseWriter, r *http.Request) {
 	args.path = getPathForTranslib(r, rc)
 	glog.V(1).Infof("[%s] Translated path = %s", reqID, args.path)
 
-	status, data, err = invokeTranslib(&args, r, rc)
+	status, data, err = invokeTranslib(&args, rc)
 	if err != nil {
-		glog.Errorf("[%s] Translib error %T - %v", reqID, err, err)
+		glog.Warningf("[%s] Translib error %T - %v", reqID, err, err)
 		status, data, rtype = prepareErrorResponse(err, r)
 		goto write_resp
 	}
@@ -70,7 +81,7 @@ func Process(w http.ResponseWriter, r *http.Request) {
 
 	rtype, err = resolveResponseContentType(data, r, rc)
 	if err != nil {
-		glog.Errorf("[%s] Failed to resolve response content-type, err=%v", rc.ID, err)
+		glog.Warningf("[%s] Failed to resolve response content-type, err=%v", rc.ID, err)
 		status, data, rtype = prepareErrorResponse(err, r)
 		goto write_resp
 	}
@@ -92,6 +103,17 @@ write_resp:
 		// No data, status only
 		w.WriteHeader(status)
 	}
+}
+
+// getRequestID returns the request ID for a http Request r.
+// ID is looked up from the RequestContext associated with this request.
+// Returns empty value if context is not initialized yet.
+func getRequestID(r *http.Request) string {
+	cv := getContextValue(r, requestContextKey)
+	if cv != nil {
+		return cv.(*RequestContext).ID
+	}
+	return ""
 }
 
 // getRequestBody returns the validated request body
@@ -119,7 +141,7 @@ func getRequestBody(r *http.Request, rc *RequestContext) (*MediaType, []byte, er
 
 	ct, err := parseMediaType(ctype)
 	if err != nil {
-		glog.Errorf("[%s] Bad content-type '%s'; err=%v",
+		glog.Warningf("[%s] Bad content-type '%s'; err=%v",
 			rc.ID, r.Header.Get("Content-Type"), err)
 		return nil, nil, httpBadRequest("Bad content-type")
 	}
@@ -127,7 +149,7 @@ func getRequestBody(r *http.Request, rc *RequestContext) (*MediaType, []byte, er
 	// Check if content type is one of the acceptable types specified
 	// in "consumes" section in OpenAPI spec.
 	if !rc.Consumes.Contains(ct.Type) {
-		glog.Errorf("[%s] Content-type '%s' not supported. Valid types %v", rc.ID, ct.Type, rc.Consumes)
+		glog.Warningf("[%s] Content-type '%s' not supported. Valid types %v", rc.ID, ct.Type, rc.Consumes)
 		return nil, nil, httpError(http.StatusUnsupportedMediaType, "Unsupported content-type")
 	}
 
@@ -206,10 +228,15 @@ func escapeKeyValue(val string) string {
 	return val
 }
 
-// trimRestconfPrefix removes "/restconf/data" prefix from the path.
+// trimRestconfPrefix removes "*/restconf/data" or "*/restconf/operations"
+// prefix from the path. Returns unchanged path if none of these prefixes found.
 func trimRestconfPrefix(path string) string {
-	pattern := "/restconf/data/"
+	pattern := restconfDataPathPrefix
 	k := strings.Index(path, pattern)
+	if k < 0 {
+		pattern = restconfOperPathPrefix
+		k = strings.Index(path, pattern)
+	}
 	if k >= 0 {
 		path = path[k+len(pattern)-1:]
 	}
@@ -217,23 +244,68 @@ func trimRestconfPrefix(path string) string {
 	return path
 }
 
+// isOperationsRequest checks if a request is a RESTCONF operations
+// request (rpc or action)
+func isOperationsRequest(r *http.Request) bool {
+	k := strings.Index(r.URL.Path, restconfOperPathPrefix)
+	return k >= 0
+	//TODO handle yang actions.. URL pattern cannot identify action requests.
+	// Works for now as current yang-to-openapi generator does not support them.
+}
+
 // translibArgs holds arguments for invoking translib APIs.
 type translibArgs struct {
-	path string // Translib path
-	data []byte // payload
+	method      string           // API name
+	path        string           // Translib path
+	data        []byte           // payload
+	version     translib.Version // client version
+	depth       uint             // RESTCONF depth, for Get API only
+	deleteEmpty bool             // Delete empty entry during field delete
+}
+
+// parseMethod maps http method name to translib method.
+func (args *translibArgs) parseMethod(r *http.Request, rc *RequestContext) error {
+	switch r.Method {
+	case "GET", "HEAD", "PUT", "PATCH", "DELETE":
+		args.method = r.Method
+	case "POST":
+		if isOperationsRequest(r) {
+			args.method = "ACTION"
+		} else {
+			args.method = r.Method
+		}
+	default:
+		glog.Warningf("[%s] Unknown method '%v'", rc.ID, r.Method)
+		return httpBadRequest("Invalid method")
+	}
+	return nil
+}
+
+// parseClientVersion parses the Accept-Version request header value
+func (args *translibArgs) parseClientVersion(r *http.Request, rc *RequestContext) error {
+	if v := r.Header.Get("Accept-Version"); len(v) != 0 {
+		if err := args.version.Set(v); err != nil {
+			return httpBadRequest("Invalid Accept-Version \"%s\"", v)
+		}
+	}
+
+	glog.V(1).Infof("[%s] Client version = \"%s\"", rc.ID, args.version)
+	return nil
 }
 
 // invokeTranslib calls appropriate TransLib API for the given HTTP
 // method. Returns response status code and content.
-func invokeTranslib(args *translibArgs, r *http.Request, rc *RequestContext) (int, []byte, error) {
+func invokeTranslib(args *translibArgs, rc *RequestContext) (int, []byte, error) {
 	var status = 400
 	var content []byte
 	var err error
 
-	switch r.Method {
+	switch args.method {
 	case "GET", "HEAD":
 		req := translib.GetRequest{
-			Path: args.path,
+			Path:          args.path,
+			Depth:         args.depth,
+			ClientVersion: args.version,
 		}
 		resp, err1 := translib.Get(req)
 		if err1 == nil {
@@ -247,8 +319,9 @@ func invokeTranslib(args *translibArgs, r *http.Request, rc *RequestContext) (in
 		//TODO return 200 for operations request
 		status = 201
 		req := translib.SetRequest{
-			Path:    args.path,
-			Payload: args.data,
+			Path:          args.path,
+			Payload:       args.data,
+			ClientVersion: args.version,
 		}
 		_, err = translib.Create(req)
 
@@ -256,29 +329,47 @@ func invokeTranslib(args *translibArgs, r *http.Request, rc *RequestContext) (in
 		//TODO send 201 if PUT resulted in creation
 		status = 204
 		req := translib.SetRequest{
-			Path:    args.path,
-			Payload: args.data,
+			Path:          args.path,
+			Payload:       args.data,
+			ClientVersion: args.version,
 		}
 		_, err = translib.Replace(req)
 
 	case "PATCH":
 		status = 204
 		req := translib.SetRequest{
-			Path:    args.path,
-			Payload: args.data,
+			Path:          args.path,
+			Payload:       args.data,
+			ClientVersion: args.version,
 		}
 		_, err = translib.Update(req)
 
 	case "DELETE":
 		status = 204
 		req := translib.SetRequest{
-			Path: args.path,
+			Path:             args.path,
+			ClientVersion:    args.version,
+			DeleteEmptyEntry: args.deleteEmpty,
 		}
 		_, err = translib.Delete(req)
 
+	case "ACTION":
+		req := translib.ActionRequest{
+			Path:          args.path,
+			Payload:       args.data,
+			ClientVersion: args.version,
+		}
+		res, err1 := translib.Action(req)
+		if err1 == nil {
+			status = 200
+			content = res.Payload
+		} else {
+			err = err1
+		}
+
 	default:
-		glog.Errorf("[%s] Unknown method '%v'", rc.ID, r.Method)
-		err = httpBadRequest("Invalid method")
+		glog.Errorf("[%s] Unknown method '%v'", rc.ID, args.method)
+		err = httpError(http.StatusNotImplemented, "Internal error")
 	}
 
 	return status, content, err

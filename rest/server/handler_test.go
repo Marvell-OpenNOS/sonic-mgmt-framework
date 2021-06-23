@@ -28,6 +28,8 @@ import (
 	"sort"
 	"strings"
 	"testing"
+
+	"github.com/Azure/sonic-mgmt-common/translib"
 )
 
 var testRouter *Router
@@ -220,6 +222,16 @@ func TestPathConv(t *testing.T) {
 		"/myroot/restconf/data/id={name}",
 		"/myroot/restconf/data/id=TEST1",
 		"/id[name=TEST1]"))
+
+	t.Run("rcoper", testPathConv(
+		"/restconf/operations/hello-world",
+		"/restconf/operations/hello-world",
+		"/hello-world"))
+
+	t.Run("x_rcoper", testPathConv(
+		"/myroot/restconf/operations/hello-world",
+		"/myroot/restconf/operations/hello-world",
+		"/hello-world"))
 
 	t.Run("no_template", testPathConv(
 		"*",
@@ -501,6 +513,61 @@ func testRespData(r *http.Request, rc *RequestContext, data []byte, expType stri
 	}
 }
 
+func TestVersion_none(t *testing.T) {
+	r := httptest.NewRequest("GET", "/test", nil)
+	verifyParseVersion(t, r, true, translib.Version{})
+}
+
+func TestVersion_empty(t *testing.T) {
+	r := httptest.NewRequest("GET", "/test", nil)
+	r.Header.Set("Accept-Version", "")
+	verifyParseVersion(t, r, true, translib.Version{})
+}
+
+func TestVersion_000(t *testing.T) {
+	r := httptest.NewRequest("GET", "/test", nil)
+	r.Header.Set("Accept-Version", "0.0.0")
+	verifyParseVersion(t, r, false, translib.Version{})
+}
+
+func TestVersion_123(t *testing.T) {
+	r := httptest.NewRequest("GET", "/test", nil)
+	r.Header.Set("Accept-Version", "1.2.3")
+	verifyParseVersion(t, r, true, translib.Version{Major: 1, Minor: 2, Patch: 3})
+}
+
+func TestVersion_bad(t *testing.T) {
+	r := httptest.NewRequest("GET", "/test", nil)
+	r.Header.Set("Accept-Version", "bad")
+	verifyParseVersion(t, r, false, translib.Version{})
+}
+
+func verifyParseVersion(t *testing.T, r *http.Request, expSuccess bool, expVer translib.Version) {
+	var args translibArgs
+	rc, r := GetContext(r)
+	err := args.parseClientVersion(r, rc)
+	ver := r.Header.Get("Accept-Version")
+
+	if expSuccess && err != nil {
+		t.Fatalf("Unexpected error parsing AcceptVersion \"%s\"; err=%v", ver, err)
+	}
+	if !expSuccess && err == nil {
+		t.Fatalf("Expected error parsing AcceptVersion \"%s\"", ver)
+	}
+	if expSuccess && args.version != expVer {
+		t.Fatalf("Failed to parse AcceptVersion \"%s\"; expected=%s, found=%s", ver, expVer, args.version)
+	}
+}
+
+func TestPanic(t *testing.T) {
+	s := newEmptyRouter()
+	s.addRoute("panic", "GET", "/panic",
+		func(w http.ResponseWriter, r *http.Request) { panic("testing 123") })
+	w := httptest.NewRecorder()
+	s.ServeHTTP(w, prepareRequest(t, "GET", "/panic", ""))
+	verifyResponse(t, w, 500)
+}
+
 func TestProcessGET(t *testing.T) {
 	w := httptest.NewRecorder()
 	Process(w, prepareRequest(t, "GET", "/api-tests:sample", ""))
@@ -554,6 +621,20 @@ func TestProcessPOST_error(t *testing.T) {
 	w := httptest.NewRecorder()
 	Process(w, prepareRequest(t, "POST", "/api-tests:sample/error/invalid-args", "{}"))
 	verifyResponse(t, w, 400)
+}
+
+func TestProcessRPC(t *testing.T) {
+	w := httptest.NewRecorder()
+	Process(w, prepareRequest(t, "POST", "/restconf/operations/api-tests:my-echo",
+		"{\"/api-tests:input\":{\"message\":\"Hii\"}}"))
+	verifyResponse(t, w, 200)
+}
+
+func TestProcessRPC_error(t *testing.T) {
+	w := httptest.NewRecorder()
+	Process(w, prepareRequest(t, "POST", "/restconf/operations/api-tests:my-echo",
+		"{\"api-tests:input\":{\"error-type\":\"not-supported\"}}"))
+	verifyResponse(t, w, 405)
 }
 
 func TestProcessPATCH(t *testing.T) {

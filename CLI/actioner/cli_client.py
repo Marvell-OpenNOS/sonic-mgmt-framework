@@ -1,3 +1,4 @@
+#!/usr/bin/python3
 ################################################################################
 #                                                                              #
 #  Copyright 2019 Broadcom. The term Broadcom refers to Broadcom Inc. and/or   #
@@ -38,7 +39,7 @@ class ApiClient(object):
     __session = requests.Session()
 
 
-    def request(self, method, path, data=None, headers={}, query=None):
+    def request(self, method, path, data=None, headers={}, query=None, response_type=None):
 
         url = '{0}{1}'.format(ApiClient.__api_root, path)
 
@@ -60,7 +61,7 @@ class ApiClient(object):
                 params=query,
                 verify=False)
 
-            return Response(r)
+            return Response(r, response_type)
 
         except requests.RequestException as e:
             log_warning('cli_client request exception: ' + str(e))
@@ -68,12 +69,16 @@ class ApiClient(object):
             msg = '%Error: Could not connect to Management REST Server'
             return ApiClient.__new_error_response(msg)
 
-    def post(self, path, data):
-        return self.request("POST", path, data)
+    def post(self, path, data={}, response_type=None):
+        return self.request("POST", path, data, response_type=response_type)
 
-    def get(self, path, depth=None):
+    def get(self, path, depth=None, ignore404=True, response_type=None):
         q = self.prepare_query(depth=depth)
-        return self.request("GET", path, query=q)
+        resp = self.request("GET", path, query=q, response_type=response_type)
+        if ignore404 and resp.status_code == 404:
+            resp.status_code = 200
+            resp.content = None
+        return resp
 
     def head(self, path, depth=None):
         q = self.prepare_query(depth=depth)
@@ -85,18 +90,21 @@ class ApiClient(object):
     def patch(self, path, data):
         return self.request("PATCH", path, data)
 
-    def delete(self, path, ignore404=True):
-        resp = self.request("DELETE", path, data=None)
+    def delete(self, path, ignore404=True, deleteEmptyEntry=False):
+        q = self.prepare_query(deleteEmptyEntry=deleteEmptyEntry)
+        resp = self.request("DELETE", path, data=None, query=q)
         if ignore404 and resp.status_code == 404:
             resp.status_code = 204
             resp.content = None
         return resp
 
     @staticmethod
-    def prepare_query(depth=None):
+    def prepare_query(depth=None, deleteEmptyEntry=None):
         query = {}
         if depth != None and depth != "unbounded":
             query["depth"] = depth
+        if deleteEmptyEntry is True:
+            query["deleteEmptyEntry"] = "true"
         return query
 
     @staticmethod
@@ -115,7 +123,7 @@ class Path(object):
         self.template = template
         self.params = kwargs
         self.path = template
-        for k, v in kwargs.items():
+        for k, v in list(kwargs.items()):
             self.path = self.path.replace('{%s}' % k, quote(v, safe=''))
 
     def __str__(self):
@@ -123,14 +131,17 @@ class Path(object):
 
 
 class Response(object):
-    def __init__(self, response):
+    def __init__(self, response, response_type=None):
         self.response = response
+        self.response_type = response_type
         self.status_code = response.status_code
         self.content = response.content
 
         try:
             if response.content is None or len(response.content) == 0:
                 self.content = None
+            elif self.response_type and self.response_type.lower() == 'string':
+                self.content = str(response.content).decode('string_escape')
             elif has_json_content(response):
                 self.content = json.loads(response.content, object_pairs_hook=OrderedDict)
         except ValueError:
